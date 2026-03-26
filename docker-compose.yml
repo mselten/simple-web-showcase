@@ -3,6 +3,6 @@ services:
   webserver:
     build: ./webserver
     ports:
-      - "5000:80"
+      - "${SERVER_PORT}:${SERVER_PORT}"
     env_file:
       - .env

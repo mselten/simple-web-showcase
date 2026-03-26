@@ -25,7 +25,16 @@ def load_config():
         "password": os.getenv("WS_PASSWORD", ""),
         "host": os.getenv("SERVER_HOST", "localhost"),
         "port": os.getenv("SERVER_PORT", "5000"),
+        "device": int(os.getenv("AUDIO_DEVICE")) if os.getenv("AUDIO_DEVICE") else None,
     }
+
+
+def get_device_sample_rate(device_index):
+    if device_index is None:
+        dev = sd.query_devices(kind="input")
+    else:
+        dev = sd.query_devices(device_index)
+    return int(dev.get("default_sample_rate", dev.get("sample_rate", 16000)))
 
 
 class AudioStreamer:
@@ -60,7 +69,8 @@ class AudioStreamer:
 
     def start(self):
         self.running = True
-        self.connect()
+        sample_rate = get_device_sample_rate(self.config.get("device"))
+        chunk_size = sample_rate * CHUNK_DURATION_MS // 1000
 
         def audio_callback_wrapper(indata, frames, time_info, status):
             if status:
@@ -77,14 +87,15 @@ class AudioStreamer:
                 self.reconnect()
 
         self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
+            samplerate=sample_rate,
             channels=1,
             dtype="int16",
-            blocksize=CHUNK_SIZE,
+            blocksize=chunk_size,
             callback=audio_callback_wrapper,
+            device=self.config["device"],
         )
         self.stream.start()
-        print(f"Streaming audio at {SAMPLE_RATE}Hz, {CHUNK_DURATION_MS}ms chunks")
+        print(f"Streaming audio at {sample_rate}Hz, {CHUNK_DURATION_MS}ms chunks")
 
         try:
             while self.running:
@@ -104,7 +115,33 @@ class AudioStreamer:
 
 
 def test_mode(config):
-    print("Test mode: capturing 3 seconds of audio...")
+    print("=== Available Input Devices ===")
+    devices = sd.query_devices()
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            print(f"  {i}: {dev['name']} ({dev['max_input_channels']} ch)")
+
+    device = config.get("device")
+    device_info = (
+        sd.query_devices(device)
+        if device is not None
+        else sd.query_devices(kind="input")
+    )
+    sample_rate = int(
+        device_info.get("default_sample_rate", device_info.get("sample_rate", 48000))
+    )
+    device_name = device_info.get("name", "unknown")
+
+    print()
+    print(f"Test mode: capturing 3 seconds of audio...")
+    print(f"Using device: {device_name} (index: {device})")
+    print(f"Sample rate: {sample_rate} Hz")
+    print()
+    print(f"Test mode: capturing 3 seconds of audio...")
+    print(f"Using device: {device_name} (index: {device})")
+    print(f"Sample rate: {sample_rate} Hz")
+    print()
+
     audio_data = []
 
     def callback(indata, frames, time_info, status):
@@ -113,11 +150,12 @@ def test_mode(config):
         audio_data.append(indata.copy())
 
     stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
+        samplerate=sample_rate,
         channels=1,
         dtype="int16",
-        blocksize=CHUNK_SIZE,
+        blocksize=sample_rate * CHUNK_DURATION_MS // 1000,
         callback=callback,
+        device=device,
     )
 
     with stream:
@@ -127,11 +165,35 @@ def test_mode(config):
         combined = np.concatenate(audio_data)
         rms = np.sqrt(np.mean(combined.astype(np.float32) ** 2))
         peak = np.max(np.abs(combined))
+        min_val = np.min(combined)
+        max_val = np.max(combined)
+        std_val = np.std(combined)
+
+        print("=== Results ===")
+        print(f"Total samples: {len(combined)}")
         print(f"RMS amplitude: {rms:.2f}")
         print(f"Peak amplitude: {peak}")
-        print(f"Total samples: {len(combined)}")
+        print(f"Min value: {min_val}")
+        print(f"Max value: {max_val}")
+        print(f"Std deviation: {std_val:.2f}")
+        print()
+        print("First 10 samples:", combined[:10].tolist())
+        print()
+
+        # Assessment
+        if std_val < 100:
+            print("❌ DEAD MIC: Very low variation (std < 100)")
+        elif std_val < 500:
+            print("⚠️  QUIET: Low variation (std 100-500), may need gain adjustment")
+        elif rms > 5000:
+            print("✅ GOOD: Strong signal with good variation")
+        elif rms > 1000:
+            print("✅ OK: Decent signal")
+        else:
+            print("⚠️  WEAK: Low RMS, but mic appears to be working")
     else:
         print("No audio captured")
+    print()
     print("Test complete")
 
 
