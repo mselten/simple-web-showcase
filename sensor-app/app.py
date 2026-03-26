@@ -12,11 +12,11 @@ import numpy as np
 import sounddevice as sd
 import socketio
 from dotenv import load_dotenv
+from scipy import signal
 
 SCRIPT_DIR = Path(__file__).parent
-SAMPLE_RATE = 16000
+TARGET_SAMPLE_RATE = 16000
 CHUNK_DURATION_MS = 100
-CHUNK_SIZE = SAMPLE_RATE * CHUNK_DURATION_MS // 1000
 
 
 def load_config():
@@ -35,6 +35,16 @@ def get_device_sample_rate(device_index):
     else:
         dev = sd.query_devices(device_index)
     return int(dev.get("default_sample_rate", dev.get("sample_rate", 16000)))
+
+
+def resample_audio(audio_data, orig_rate, target_rate):
+    if orig_rate == target_rate:
+        return audio_data
+    num_samples = int(len(audio_data) * target_rate / orig_rate)
+    resampled = signal.resample_poly(
+        audio_data, target_rate, orig_rate, num=num_samples
+    )
+    return resampled.astype(np.int16)
 
 
 class AudioStreamer:
@@ -69,13 +79,15 @@ class AudioStreamer:
 
     def start(self):
         self.running = True
-        sample_rate = get_device_sample_rate(self.config.get("device"))
-        chunk_size = sample_rate * CHUNK_DURATION_MS // 1000
+        device_rate = get_device_sample_rate(self.config.get("device"))
+        device_chunk_size = device_rate * CHUNK_DURATION_MS // 1000
 
         def audio_callback_wrapper(indata, frames, time_info, status):
             if status:
                 print(f"Audio status: {status}", file=sys.stderr)
-            audio_bytes = (indata.flatten() * 32767).astype("int16").tobytes()
+            audio_int16 = (indata.flatten() * 32767).astype(np.int16)
+            resampled = resample_audio(audio_int16, device_rate, TARGET_SAMPLE_RATE)
+            audio_bytes = resampled.tobytes()
             try:
                 if self.sio.connected:
                     encoded = base64.b64encode(audio_bytes).decode("utf-8")
@@ -87,15 +99,17 @@ class AudioStreamer:
                 self.reconnect()
 
         self.stream = sd.InputStream(
-            samplerate=sample_rate,
+            samplerate=device_rate,
             channels=1,
             dtype="int16",
-            blocksize=chunk_size,
+            blocksize=device_chunk_size,
             callback=audio_callback_wrapper,
             device=self.config["device"],
         )
         self.stream.start()
-        print(f"Streaming audio at {sample_rate}Hz, {CHUNK_DURATION_MS}ms chunks")
+        print(
+            f"Captured at {device_rate}Hz, resampled to {TARGET_SAMPLE_RATE}Hz, {CHUNK_DURATION_MS}ms chunks"
+        )
 
         try:
             while self.running:
