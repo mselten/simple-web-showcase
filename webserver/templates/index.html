@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Visualizer</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+        #app {
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(90deg, #00d9ff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .status-bar {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 20px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 10px;
+            backdrop-filter: blur(10px);
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff4444;
+            transition: all 0.3s;
+        }
+        .status-dot.connected {
+            background: #00ff88;
+            box-shadow: 0 0 15px #00ff88;
+        }
+        .visualizer-container {
+            background: rgba(0,0,0,0.3);
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .visualizer-title {
+            font-size: 1.1rem;
+            margin-bottom: 15px;
+            color: #00d9ff;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            border-radius: 10px;
+            background: #0a0a0f;
+        }
+        .waveform-stats {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 15px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .stat-box {
+            text-align: center;
+            padding: 15px 25px;
+            background: rgba(0,217,255,0.1);
+            border-radius: 10px;
+            min-width: 120px;
+        }
+        .stat-label {
+            font-size: 0.8rem;
+            color: #888;
+            margin-bottom: 5px;
+        }
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #00d9ff;
+        }
+        .no-data {
+            text-align: center;
+            padding: 50px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="header">
+            <h1>🎙️ Audio Visualizer</h1>
+        </div>
+        
+        <div class="status-bar">
+            <div class="status-item">
+                <div class="status-dot" :class="{ connected: connected }"></div>
+                <span v-if="connected">Connected</span>
+                <span v-else>Disconnected</span>
+            </div>
+            <div class="status-item">
+                <span v-text="'Samples: ' + sampleCount"></span>
+            </div>
+        </div>
+
+        <div class="visualizer-container" v-if="connected">
+            <div class="visualizer-title">Waveform</div>
+            <canvas ref="waveformCanvas" width="1100" height="200"></canvas>
+            <div class="waveform-stats">
+                <div class="stat-box">
+                    <div class="stat-label">RMS</div>
+                    <div class="stat-value" v-text="rms.toFixed(2)"></div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Peak</div>
+                    <div class="stat-value" v-text="peak.toFixed(2)"></div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Frequency</div>
+                    <div class="stat-value" v-text="frequency + ' Hz'"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="visualizer-container" v-else>
+            <div class="no-data">
+                <h2>Waiting for audio stream...</h2>
+                <p>Connect sensor-app to start visualization</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const connected = ref(false);
+                const sampleCount = ref(0);
+                const rms = ref(0);
+                const peak = ref(0);
+                const frequency = ref(0);
+                const waveformCanvas = ref(null);
+                let audioBuffer = [];
+                let socket = null;
+                let animationId = null;
+
+                const connectSocket = () => {
+                    socket = io();
+                    
+                    socket.on('connect', () => {
+                        connected.value = true;
+                        console.log('SocketIO connected');
+                    });
+
+                    socket.on('disconnect', () => {
+                        connected.value = false;
+                    });
+
+                    socket.on('audio_data', (msg) => {
+                        const binary = atob(msg.data);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) {
+                            bytes[i] = binary.charCodeAt(i);
+                        }
+                        const int16Array = new Int16Array(bytes.buffer);
+                        audioBuffer.push(...int16Array);
+                        if (audioBuffer.length > 16000) {
+                            audioBuffer = audioBuffer.slice(-16000);
+                        }
+                        sampleCount.value += int16Array.length;
+                        calculateStats(int16Array);
+                    });
+                };
+
+                const calculateStats = (data) => {
+                    let sum = 0;
+                    let max = 0;
+                    for (let i = 0; i < data.length; i++) {
+                        const val = Math.abs(data[i]);
+                        sum += val * val;
+                        if (val > max) max = val;
+                    }
+                    rms.value = Math.sqrt(sum / data.length) / 32768;
+                    peak.value = max / 32768;
+                };
+
+                const drawWaveform = () => {
+                    const canvas = waveformCanvas.value;
+                    if (!canvas) return;
+                    const ctx = canvas.getContext('2d');
+                    const width = canvas.width;
+                    const height = canvas.height;
+                    
+                    ctx.fillStyle = '#0a0a0f';
+                    ctx.fillRect(0, 0, width, height);
+
+                    if (audioBuffer.length < 2) {
+                        animationId = requestAnimationFrame(drawWaveform);
+                        return;
+                    }
+
+                    const gradient = ctx.createLinearGradient(0, 0, width, 0);
+                    gradient.addColorStop(0, '#00d9ff');
+                    gradient.addColorStop(0.5, '#00ff88');
+                    gradient.addColorStop(1, '#00d9ff');
+                    
+                    ctx.strokeStyle = gradient;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+
+                    const step = Math.max(1, Math.floor(audioBuffer.length / width));
+                    const centerY = height / 2;
+
+                    for (let i = 0; i < width; i++) {
+                        const idx = Math.floor(i * step);
+                        const sample = audioBuffer[idx] / 32768;
+                        const y = centerY - sample * (height * 0.4);
+                        if (i === 0) {
+                            ctx.moveTo(i, y);
+                        } else {
+                            ctx.lineTo(i, y);
+                        }
+                    }
+                    ctx.stroke();
+
+                    ctx.strokeStyle = 'rgba(0, 217, 255, 0.3)';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(0, centerY);
+                    ctx.lineTo(width, centerY);
+                    ctx.stroke();
+
+                    animationId = requestAnimationFrame(drawWaveform);
+                };
+
+                onMounted(() => {
+                    connectSocket();
+                    drawWaveform();
+                });
+
+                return {
+                    connected,
+                    sampleCount,
+                    rms,
+                    peak,
+                    frequency,
+                    waveformCanvas
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
