@@ -76,6 +76,7 @@
         canvas {
             display: block;
             width: 100%;
+            height: 200px;
             border-radius: 10px;
             background: #0a0a0f;
         }
@@ -99,9 +100,10 @@
             margin-bottom: 5px;
         }
         .stat-value {
-            font-size: 1.5rem;
+            font-size: 1.2rem;
             font-weight: bold;
             color: #00d9ff;
+            font-variant-numeric: tabular-nums;
         }
         .no-data {
             text-align: center;
@@ -119,7 +121,8 @@
         <div class="status-bar">
             <div class="status-item">
                 <div class="status-dot" :class="{ connected: connected }"></div>
-                <span v-if="connected">Connected</span>
+                <span v-if="connected && streaming">Streaming</span>
+                <span v-else-if="connected">Connected (no audio)</span>
                 <span v-else>Disconnected</span>
             </div>
             <div class="status-item">
@@ -127,7 +130,7 @@
             </div>
         </div>
 
-        <div class="visualizer-container" v-if="connected">
+        <div class="visualizer-container" v-if="streaming">
             <div class="visualizer-title">Waveform</div>
             <canvas ref="waveformCanvas" width="1100" height="200"></canvas>
             <div class="waveform-stats">
@@ -144,6 +147,8 @@
                     <div class="stat-value" v-text="frequency + ' Hz'"></div>
                 </div>
             </div>
+            <div class="visualizer-title" style="margin-top: 20px;">Spectrum (FFT)</div>
+            <canvas ref="fftCanvas" width="1100" height="150"></canvas>
         </div>
 
         <div class="visualizer-container" v-else>
@@ -160,11 +165,13 @@
         createApp({
             setup() {
                 const connected = ref(false);
+                const streaming = ref(false);
                 const sampleCount = ref(0);
                 const rms = ref(0);
                 const peak = ref(0);
                 const frequency = ref(0);
                 const waveformCanvas = ref(null);
+                const fftCanvas = ref(null);
                 let audioBuffer = [];
                 let socket = null;
                 let animationId = null;
@@ -179,9 +186,11 @@
 
                     socket.on('disconnect', () => {
                         connected.value = false;
+                        streaming.value = false;
                     });
 
                     socket.on('audio_data', (msg) => {
+                        streaming.value = true;
                         const binary = atob(msg.data);
                         const bytes = new Uint8Array(binary.length);
                         for (let i = 0; i < binary.length; i++) {
@@ -207,11 +216,25 @@
                     }
                     rms.value = Math.sqrt(sum / data.length) / 32768;
                     peak.value = max / 32768;
+                    
+                    // Frequency detection using zero-crossing rate
+                    let zeroCrossings = 0;
+                    for (let i = 1; i < data.length; i++) {
+                        if ((data[i-1] >= 0 && data[i] < 0) || (data[i-1] < 0 && data[i] >= 0)) {
+                            zeroCrossings++;
+                        }
+                    }
+                    const sampleRate = 16000;
+                    const estimatedFreq = (zeroCrossings * sampleRate) / (2 * data.length);
+                    frequency.value = Math.round(estimatedFreq);
                 };
 
                 const drawWaveform = () => {
                     const canvas = waveformCanvas.value;
-                    if (!canvas) return;
+                    if (!canvas) {
+                        requestAnimationFrame(drawWaveform);
+                        return;
+                    }
                     const ctx = canvas.getContext('2d');
                     const width = canvas.width;
                     const height = canvas.height;
@@ -220,9 +243,15 @@
                     ctx.fillRect(0, 0, width, height);
 
                     if (audioBuffer.length < 2) {
-                        animationId = requestAnimationFrame(drawWaveform);
+                        ctx.fillStyle = '#666';
+                        ctx.font = '14px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.fillText('Waiting for audio data...', width/2, height/2);
+                        requestAnimationFrame(drawWaveform);
                         return;
                     }
+
+                    // Draw waveform
 
                     const gradient = ctx.createLinearGradient(0, 0, width, 0);
                     gradient.addColorStop(0, '#00d9ff');
@@ -255,21 +284,91 @@
                     ctx.lineTo(width, centerY);
                     ctx.stroke();
 
-                    animationId = requestAnimationFrame(drawWaveform);
+                    requestAnimationFrame(drawWaveform);
+                };
+
+                const drawFFT = () => {
+                    const canvas = fftCanvas.value;
+                    if (!canvas) {
+                        requestAnimationFrame(drawFFT);
+                        return;
+                    }
+                    const ctx = canvas.getContext('2d');
+                    const width = canvas.width;
+                    const height = canvas.height;
+                    
+                    ctx.fillStyle = '#0a0a0f';
+                    ctx.fillRect(0, 0, width, height);
+
+                    if (audioBuffer.length < 256) {
+                        requestAnimationFrame(drawFFT);
+                        return;
+                    }
+
+                    // Simple FFT using DFT for first N bins
+                    const n = 256;
+                    const fftSize = Math.min(audioBuffer.length, n);
+                    const magnitudes = [];
+                    
+                    for (let k = 0; k < fftSize / 2; k++) {
+                        let real = 0;
+                        let imag = 0;
+                        for (let i = 0; i < fftSize; i++) {
+                            const sample = audioBuffer[audioBuffer.length - fftSize + i] / 32768;
+                            const angle = (2 * Math.PI * k * i) / fftSize;
+                            real += sample * Math.cos(angle);
+                            imag += sample * Math.sin(angle);
+                        }
+                        magnitudes.push(Math.sqrt(real * real + imag * imag));
+                    }
+
+                    // Normalize
+                    const maxMag = Math.max(...magnitudes);
+                    const normalizedMag = magnitudes.map(m => maxMag > 0 ? m / maxMag : 0);
+
+                    // Draw bars
+                    const barWidth = width / normalizedMag.length;
+                    const gradient = ctx.createLinearGradient(0, height, 0, 0);
+                    gradient.addColorStop(0, '#00d9ff');
+                    gradient.addColorStop(0.5, '#00ff88');
+                    gradient.addColorStop(1, '#ff00d9');
+                    
+                    ctx.fillStyle = gradient;
+                    
+                    for (let i = 0; i < normalizedMag.length; i++) {
+                        const barHeight = normalizedMag[i] * height * 0.9;
+                        const x = i * barWidth;
+                        ctx.fillRect(x, height - barHeight, barWidth - 1, barHeight);
+                    }
+
+                    // Frequency labels
+                    ctx.fillStyle = '#888';
+                    ctx.font = '10px sans-serif';
+                    const sampleRate = 16000;
+                    for (let i = 0; i <= 4; i++) {
+                        const x = (i / 4) * width;
+                        const freq = Math.round((i / 4) * (sampleRate / 2));
+                        ctx.fillText(freq + ' Hz', x + 2, height - 2);
+                    }
+
+                    requestAnimationFrame(drawFFT);
                 };
 
                 onMounted(() => {
                     connectSocket();
                     drawWaveform();
+                    drawFFT();
                 });
 
                 return {
                     connected,
+                    streaming,
                     sampleCount,
                     rms,
                     peak,
                     frequency,
-                    waveformCanvas
+                    waveformCanvas,
+                    fftCanvas
                 };
             }
         }).mount('#app');

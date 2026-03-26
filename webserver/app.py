@@ -30,9 +30,6 @@ config = load_config()
 def process_audio(audio_data: np.ndarray) -> np.ndarray:
     audio_float = audio_data.astype(np.float32) / 32768.0
     audio_float = audio_float - np.mean(audio_float)
-    max_val = np.max(np.abs(audio_float))
-    if max_val > 0:
-        audio_float = audio_float / max_val
     return (audio_float * 32767).astype(np.int16)
 
 
