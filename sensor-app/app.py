@@ -87,6 +87,12 @@ class AudioStreamer:
                 print(f"Audio status: {status}", file=sys.stderr)
             audio_int16 = (indata.flatten() * 32767).astype(np.int16)
             resampled = resample_audio(audio_int16, device_rate, TARGET_SAMPLE_RATE)
+
+            # Noise gate - skip near-silent audio
+            rms = np.sqrt(np.mean(resampled.astype(np.float32) ** 2))
+            if rms < 100:  # Threshold for quiet room noise
+                return
+
             audio_bytes = resampled.tobytes()
             try:
                 if self.sio.connected:

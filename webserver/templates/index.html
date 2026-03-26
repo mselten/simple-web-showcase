@@ -190,13 +190,25 @@
                     });
 
                     socket.on('audio_data', (msg) => {
-                        streaming.value = true;
                         const binary = atob(msg.data);
                         const bytes = new Uint8Array(binary.length);
                         for (let i = 0; i < binary.length; i++) {
                             bytes[i] = binary.charCodeAt(i);
                         }
                         const int16Array = new Int16Array(bytes.buffer);
+                        
+                        // Check if audio is actually meaningful (not silence)
+                        let sum = 0;
+                        for (let i = 0; i < int16Array.length; i++) {
+                            sum += Math.abs(int16Array[i]);
+                        }
+                        const avg = sum / int16Array.length;
+                        
+                        if (avg > 50) {  // Only count as streaming if meaningful audio
+                            streaming.value = true;
+                            drawWaveform.lastAudioTime = Date.now();
+                        }
+                        
                         audioBuffer.push(...int16Array);
                         if (audioBuffer.length > 16000) {
                             audioBuffer = audioBuffer.slice(-16000);
@@ -300,21 +312,34 @@
                     ctx.fillStyle = '#0a0a0f';
                     ctx.fillRect(0, 0, width, height);
 
-                    if (audioBuffer.length < 256) {
+                    // Configuration
+                    const fftSize = 512;
+                    const numBars = 64;
+                    const minFreq = 500;  // Skip frequencies below 500Hz
+                    const sampleRate = 16000;
+                    const minBin = Math.floor(minFreq * fftSize / sampleRate);
+                    const barGap = 2;
+                    const barWidth = (width - (numBars - 1) * barGap) / numBars;
+                    const smoothingFactor = 0.3;
+                    const noiseThreshold = 0.05;  // Light noise filter
+                    
+                    if (audioBuffer.length < fftSize) {
                         requestAnimationFrame(drawFFT);
                         return;
                     }
 
-                    // Simple FFT using DFT for first N bins
-                    const n = 256;
-                    const fftSize = Math.min(audioBuffer.length, n);
-                    const magnitudes = [];
+                    // Get recent samples for FFT
+                    const recentSamples = audioBuffer.slice(-fftSize);
                     
-                    for (let k = 0; k < fftSize / 2; k++) {
+                    // Pre-computed twiddle factors for performance
+                    const magnitudes = [];
+                    const kMax = numBars * 2 + minBin;
+                    
+                    for (let k = minBin; k < kMax; k++) {
                         let real = 0;
                         let imag = 0;
                         for (let i = 0; i < fftSize; i++) {
-                            const sample = audioBuffer[audioBuffer.length - fftSize + i] / 32768;
+                            const sample = recentSamples[i] / 32768;
                             const angle = (2 * Math.PI * k * i) / fftSize;
                             real += sample * Math.cos(angle);
                             imag += sample * Math.sin(angle);
@@ -322,33 +347,125 @@
                         magnitudes.push(Math.sqrt(real * real + imag * imag));
                     }
 
-                    // Normalize
-                    const maxMag = Math.max(...magnitudes);
-                    const normalizedMag = magnitudes.map(m => maxMag > 0 ? m / maxMag : 0);
+                    // Log scale mapping - map 64 bars to frequency bins
+                    const barMagnitudes = [];
+                    for (let b = 0; b < numBars; b++) {
+                        // Logarithmic mapping for better bass resolution
+                        const logStart = Math.log(1) / Math.log(kMax);
+                        const logEnd = Math.log(kMax) / Math.log(kMax);
+                        const logFreq = logStart + (logEnd - logStart) * ((b + minBin) / (numBars + minBin));
+                        const binIndex = Math.floor(Math.pow(kMax - minBin, logFreq));
+                        
+                        // Average a few bins around this frequency
+                        let sum = 0;
+                        let count = 0;
+                        for (let offset = -2; offset <= 2; offset++) {
+                            const idx = Math.max(0, Math.min(magnitudes.length - 1, binIndex + offset));
+                            sum += magnitudes[idx];
+                            count++;
+                        }
+                        barMagnitudes.push(sum / count);
+                    }
 
-                    // Draw bars
-                    const barWidth = width / normalizedMag.length;
-                    const gradient = ctx.createLinearGradient(0, height, 0, 0);
-                    gradient.addColorStop(0, '#00d9ff');
-                    gradient.addColorStop(0.5, '#00ff88');
-                    gradient.addColorStop(1, '#ff00d9');
+                    // Light noise filtering - apply threshold
+                    const filteredMag = barMagnitudes.map(m => m < noiseThreshold ? 0 : m);
+
+                    // Check if we have meaningful audio
+                    const meaningfulMag = filteredMag.filter(m => m > noiseThreshold);
                     
-                    ctx.fillStyle = gradient;
+                    // Adaptive Y-scale with proper silence detection
+                    if (meaningfulMag.length === 0) {
+                        // No significant audio - reset max for quick recovery
+                        if (drawFFT.adaptiveMax !== undefined) {
+                            drawFFT.adaptiveMax *= 0.8;  // Quick decay when silent
+                        }
+                    }
                     
-                    for (let i = 0; i < normalizedMag.length; i++) {
-                        const barHeight = normalizedMag[i] * height * 0.9;
-                        const x = i * barWidth;
-                        ctx.fillRect(x, height - barHeight, barWidth - 1, barHeight);
+                    const currentMax = Math.max(...filteredMag, 1);
+                    if (!drawFFT.adaptiveMax || drawFFT.adaptiveMax < 1) {
+                        drawFFT.adaptiveMax = currentMax;
+                    }
+                    // Slow rise (0.005), fast fall (0.92)
+                    if (currentMax > drawFFT.adaptiveMax) {
+                        drawFFT.adaptiveMax += (currentMax - drawFFT.adaptiveMax) * 0.005;
+                    } else {
+                        drawFFT.adaptiveMax *= 0.92;
+                    }
+                    
+                    // Normalize with dynamic scale - no artificial floor
+                    const normalizedMag = filteredMag.map(m => {
+                        if (m < noiseThreshold) return 0;
+                        const raw = drawFFT.adaptiveMax > 0 ? m / drawFFT.adaptiveMax : 0;
+                        return Math.min(raw, 1.0);  // Clamp to max 1.0
+                    });
+
+                    // Smooth with previous frame
+                    if (!drawFFT.prevMag) {
+                        drawFFT.prevMag = normalizedMag.map(() => 0);
+                    }
+                    const smoothedMag = normalizedMag.map((m, i) => 
+                        m * smoothingFactor + drawFFT.prevMag[i] * (1 - smoothingFactor)
+                    );
+                    drawFFT.prevMag = smoothedMag;
+
+                    // Update peak hold
+                    if (!drawFFT.peakHold) {
+                        drawFFT.peakHold = smoothedMag.map(() => 0);
+                    }
+                    const peakDecay = 0.98;
+                    for (let i = 0; i < smoothedMag.length; i++) {
+                        if (smoothedMag[i] > drawFFT.peakHold[i]) {
+                            drawFFT.peakHold[i] = smoothedMag[i];
+                        } else {
+                            drawFFT.peakHold[i] *= peakDecay;
+                        }
+                    }
+
+                    // Draw bars with gradient
+                    for (let i = 0; i < smoothedMag.length; i++) {
+                        const barHeight = smoothedMag[i] * height * 0.9;
+                        const x = i * (barWidth + barGap);
+                        
+                        // Gradient based on position
+                        const hue = 180 + (i / numBars) * 120;  // Cyan to magenta
+                        const saturation = 80 + smoothedMag[i] * 20;
+                        const lightness = 50 + smoothedMag[i] * 20;
+                        
+                        // Main bar with glow
+                        const gradient = ctx.createLinearGradient(0, height, 0, height - barHeight);
+                        gradient.addColorStop(0, `hsla(${hue}, ${saturation}%, ${lightness - 20}%, 0.9)`);
+                        gradient.addColorStop(1, `hsla(${hue}, ${saturation}%, ${lightness + 20}%, 0.9)`);
+                        
+                        ctx.fillStyle = gradient;
+                        ctx.fillRect(x, height - barHeight, barWidth, barHeight);
+                        
+                        // Peak indicator
+                        if (drawFFT.peakHold[i] > 0.01) {
+                            const peakHeight = drawFFT.peakHold[i] * height * 0.9;
+                            ctx.fillStyle = `hsla(${hue}, 100%, 80%, 0.8)`;
+                            ctx.fillRect(x, height - peakHeight - 2, barWidth, 3);
+                        }
+                    }
+
+                    // Grid lines
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+                    ctx.lineWidth = 1;
+                    for (let i = 1; i < 4; i++) {
+                        const y = (i / 4) * height;
+                        ctx.beginPath();
+                        ctx.moveTo(0, y);
+                        ctx.lineTo(width, y);
+                        ctx.stroke();
                     }
 
                     // Frequency labels
-                    ctx.fillStyle = '#888';
-                    ctx.font = '10px sans-serif';
-                    const sampleRate = 16000;
-                    for (let i = 0; i <= 4; i++) {
-                        const x = (i / 4) * width;
-                        const freq = Math.round((i / 4) * (sampleRate / 2));
-                        ctx.fillText(freq + ' Hz', x + 2, height - 2);
+                    ctx.fillStyle = '#666';
+                    ctx.font = '9px monospace';
+                    ctx.textAlign = 'center';
+                    const freqLabels = [500, 1000, 1500, 2000, 2500, 3000, 4000];
+                    for (let i = 0; i < freqLabels.length; i++) {
+                        const x = (i / (freqLabels.length - 1)) * width;
+                        ctx.fillText(freqLabels[i] + 'Hz', x, height - 3);
                     }
 
                     requestAnimationFrame(drawFFT);
